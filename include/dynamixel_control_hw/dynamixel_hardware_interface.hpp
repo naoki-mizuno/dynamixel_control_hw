@@ -37,6 +37,8 @@ namespace dynamixel {
                 to arrive on seria bus
             @param dynamixel_map: map actuator's ID to its name (the one used
                 in the controller list and in URDF)
+            @param dynamixel_c_mode_map: map actuator's ID to the command
+                mode, as defined in libdynamixel dynamixel::OperatingMode
             @param dynamixel_max_speed map from actuator IDs to maximal allowed
                 velocity (the value is specific to the actuator's type)
             @param dynamixel_corrections map from actuator IDs to the correction
@@ -47,6 +49,7 @@ namespace dynamixel {
             const float& read_timeout,
             const float& scan_timeout,
             std::unordered_map<long long int, std::string> dynamixel_map,
+            std::unordered_map<long long int, OperatingMode> dynamixel_c_mode_map,
             std::unordered_map<long long int, double> dynamixel_max_speed,
             std::unordered_map<long long int, double> dynamixel_corrections)
             : _usb_serial_interface(usb_serial_interface),
@@ -54,6 +57,7 @@ namespace dynamixel {
               _read_timeout(read_timeout),
               _scan_timeout(scan_timeout),
               _dynamixel_map(dynamixel_map),
+              _c_mode_map(dynamixel_c_mode_map),
               _dynamixel_max_speed(dynamixel_max_speed),
               _dynamixel_corrections(dynamixel_corrections)
         {
@@ -91,11 +95,12 @@ namespace dynamixel {
         // ROS's hardware interface instances
         hardware_interface::JointStateInterface _jnt_state_interface;
         hardware_interface::PositionJointInterface _jnt_pos_interface;
+        hardware_interface::VelocityJointInterface _jnt_vel_interface;
 
         // Memory space shared with the controller
         // It reads here the latest robot's state and put here the next desired values
         std::vector<double> _prev_commands;
-        std::vector<double> _joint_commands; // target joint angle
+        std::vector<double> _joint_commands; // target joint angle or speed
         std::vector<double> _joint_angles; // actual joint angle
         std::vector<double> _joint_velocities; // actual joint velocity
         std::vector<double> _joint_efforts; // compulsory but not used
@@ -112,6 +117,8 @@ namespace dynamixel {
         std::vector<dynamixel_servo> _servos;
         // Map from dynamixel ID to actuator's name
         std::unordered_map<long long int, std::string> _dynamixel_map;
+        // Map from dynamixel ID to actuator's command interface (velocity/position)
+        std::unordered_map<long long int, OperatingMode> _c_mode_map;
         // Map for max speed
         std::unordered_map<long long int, double> _dynamixel_max_speed;
         // Map for hardware corrections
@@ -142,7 +149,7 @@ namespace dynamixel {
     {
         // vector of actuators we are looking for
         std::vector<typename Protocol::id_t> ids(_dynamixel_map.size());
-        using dm_iter_t = std::unordered_map<id_t, std::string>::iterator;
+        using dm_iter_t = std::unordered_map<long long int, std::string>::iterator;
         for (dm_iter_t dm_iter = _dynamixel_map.begin(); dm_iter != _dynamixel_map.end(); ++dm_iter) {
             ids.push_back(dm_iter->first);
         }
@@ -198,11 +205,13 @@ namespace dynamixel {
         // also enable the torque output on the actuators (sort of power up)
         try {
             for (unsigned i = 0; i < _servos.size(); i++) {
-                std::unordered_map<long long int, std::string>::iterator dynamixel_iterator
-                    = _dynamixel_map.find(_servos[i]->id());
+                long long int id = _servos[i]->id();
+
                 // check that the actuator's name is in the map
+                std::unordered_map<long long int, std::string>::iterator dynamixel_iterator
+                    = _dynamixel_map.find(id);
                 if (dynamixel_iterator != _dynamixel_map.end()) {
-                    // tell ros_control the in-memory address where to read the
+                    // tell ros_control the in-memory addresses where to read the
                     // information on joint angle, velocity and effort
                     hardware_interface::JointStateHandle state_handle(
                         dynamixel_iterator->second,
@@ -211,30 +220,71 @@ namespace dynamixel {
                         &_joint_efforts[i]);
                     _jnt_state_interface.registerHandle(state_handle);
 
+                    // check that the actuator control mode matches the declared
+                    // command interface (position/velocity)
+                    OperatingMode hardware_mode
+                        = operating_mode<Protocol>(_dynamixel_controller, id);
+                    std::unordered_map<long long int, OperatingMode>::iterator c_mode_map_i
+                        = _c_mode_map.find(id);
+                    if (c_mode_map_i != _c_mode_map.end()) {
+                        if (c_mode_map_i->second != hardware_mode) {
+                            ROS_ERROR_STREAM("the command interface declared "
+                                << mode2str(c_mode_map_i->second)
+                                << " for joint " << dynamixel_iterator->second
+                                << " but is set to " << mode2str(hardware_mode)
+                                << " in hardware. Using the one from hardware.");
+                            _c_mode_map[id] = hardware_mode;
+                        }
+                    }
+                    else {
+                        ROS_WARN_STREAM("the command interface was not defined "
+                            << "for joint " << dynamixel_iterator->second
+                            << " fallback to the hardware's mode: "
+                            << mode2str(hardware_mode));
+                        _c_mode_map[id] = hardware_mode;
+                    }
+
                     // tell ros_control the in-memory address to change to set new
-                    // position goal for the actuator
-                    hardware_interface::JointHandle pos_handle(
+                    // position or velocity goal for the actuator
+                    hardware_interface::JointHandle cmd_handle(
                         _jnt_state_interface.getHandle(dynamixel_iterator->second),
                         &_joint_commands[i]);
-                    _jnt_pos_interface.registerHandle(pos_handle);
+                    if (OperatingMode::joint == hardware_mode) {
+                        _jnt_pos_interface.registerHandle(cmd_handle);
+                    }
+                    else if (OperatingMode::wheel == hardware_mode) {
+                        _jnt_vel_interface.registerHandle(cmd_handle);
+                    }
+                    else
+                        ROS_ERROR_STREAM("Servo " << id << " was not initialised "
+                                                  << "(operating mode not supported)");
 
                     try {
                         // enable the actuator
                         dynamixel::StatusPacket<Protocol> status;
-                        ROS_DEBUG_STREAM("Enabling joint " << _servos[i]->id());
+                        ROS_DEBUG_STREAM("Enabling joint " << id);
                         _dynamixel_controller.send(_servos[i]->set_torque_enable(1));
                         _dynamixel_controller.recv(status);
 
-                        // set max speed
+                        // set max speed for actuators in position mode
                         std::unordered_map<long long int, double>::iterator dynamixel_max_speed_iterator
-                            = _dynamixel_max_speed.find(_servos[i]->id());
+                            = _dynamixel_max_speed.find(id);
                         if (dynamixel_max_speed_iterator != _dynamixel_max_speed.end()) {
-                            dynamixel::StatusPacket<Protocol> status;
-                            ROS_DEBUG_STREAM("Setting velocity limit of joint "
-                                << _servos[i]->id() << " to "
-                                << dynamixel_max_speed_iterator->second);
-                            _dynamixel_controller.send(_servos[i]->set_moving_speed_angle(dynamixel_max_speed_iterator->second));
-                            _dynamixel_controller.recv(status);
+                            if (OperatingMode::joint == hardware_mode) {
+                                dynamixel::StatusPacket<Protocol> status;
+                                ROS_DEBUG_STREAM("Setting velocity limit of servo "
+                                    << id << " to "
+                                    << dynamixel_max_speed_iterator->second);
+                                _dynamixel_controller.send(
+                                    _servos[i]
+                                        ->set_moving_speed_angle(dynamixel_max_speed_iterator->second));
+                                _dynamixel_controller.recv(status);
+                            }
+                            else {
+                                ROS_WARN_STREAM("A \"max speed\" was defined for servo "
+                                    << id << " but it is currently only supported for "
+                                    << "servos in position mode. Ignoring the speed limit.");
+                            }
                         }
                     }
                     catch (dynamixel::errors::Error& e) {
@@ -244,7 +294,7 @@ namespace dynamixel {
                     }
                 }
                 else {
-                    ROS_WARN_STREAM("Servo " << i << " was not initialised "
+                    ROS_WARN_STREAM("Servo " << id << " was not initialised "
                                              << "(not found in the parameters)");
                 }
             }
@@ -252,6 +302,7 @@ namespace dynamixel {
             // register the hardware interfaces
             registerInterface(&_jnt_state_interface);
             registerInterface(&_jnt_pos_interface);
+            registerInterface(&_jnt_vel_interface);
         }
         catch (const ros::Exception& e) {
             ROS_ERROR_STREAM("Could not initialize hardware interface:\n"
@@ -263,7 +314,11 @@ namespace dynamixel {
         read_joints();
 
         for (unsigned i = 0; i < _servos.size(); i++) {
-            _joint_commands[i] = _joint_angles[i];
+            OperatingMode mode = _c_mode_map[_servos[i]->id()];
+            if (OperatingMode::joint == mode)
+                _joint_commands[i] = _joint_angles[i];
+            else if (OperatingMode::wheel == mode)
+                _joint_commands[i] = 0;
         }
     }
 
@@ -344,18 +399,27 @@ namespace dynamixel {
             try {
                 dynamixel::StatusPacket<Protocol> status;
 
-                double goal_pos = _joint_commands[i];
+                double command = _joint_commands[i];
 
-                std::unordered_map<long long int, double>::iterator dynamixel_corrections_iterator
-                    = _dynamixel_corrections.find(_servos[i]->id());
-                if (dynamixel_corrections_iterator != _dynamixel_corrections.end()) {
-                    goal_pos += dynamixel_corrections_iterator->second;
+                OperatingMode mode = _c_mode_map[_servos[i]->id()];
+                if (OperatingMode::joint == mode) {
+                    std::unordered_map<long long int, double>::iterator dynamixel_corrections_iterator
+                        = _dynamixel_corrections.find(_servos[i]->id());
+                    if (dynamixel_corrections_iterator != _dynamixel_corrections.end()) {
+                        command += dynamixel_corrections_iterator->second;
+                    }
+
+                    ROS_DEBUG_STREAM("Setting position for joint "
+                        << _servos[i]->id() << " to " << command);
+                    _dynamixel_controller.send(_servos[i]->reg_goal_position_angle(command));
+                    _dynamixel_controller.recv(status);
                 }
-
-                ROS_DEBUG_STREAM("Setting position of joint "
-                    << _servos[i]->id() << " to " << goal_pos);
-                _dynamixel_controller.send(_servos[i]->reg_goal_position_angle(goal_pos));
-                _dynamixel_controller.recv(status);
+                else if (OperatingMode::wheel == mode) {
+                    ROS_DEBUG_STREAM("Setting velocity for joint "
+                        << _servos[i]->id() << " to " << command);
+                    _dynamixel_controller.send(_servos[i]->reg_moving_speed_angle(command, mode));
+                    _dynamixel_controller.recv(status);
+                }
             }
             catch (dynamixel::errors::Error& e) {
                 ROS_ERROR_STREAM("Caught a Dynamixel exception while sending "

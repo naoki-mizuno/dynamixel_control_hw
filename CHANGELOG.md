@@ -1,7 +1,8 @@
 # Main changes to the code
 
-In revers chronological order:
+In reverse chronological order:
 
+- velocity control mode integrated
 - replace c-style code with std::chrono for time-related code
 - replace std::map with std::unordered_map when possible (hypothetical performance gain)
 - remove all dependencies to boost
